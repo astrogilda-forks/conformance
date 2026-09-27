@@ -60,68 +60,146 @@ function normalizeHtu(u: string): string {
 }
 
 /**
+ * One RFC 9449 §4.3 step the token-endpoint validator enforces. The negative
+ * tests switch a single step off (see `dpopLenientProofChecks`) to build an
+ * authorization server with exactly one validation gap, and assert that exactly
+ * the probes aimed at that step fail.
+ *
+ *  - 'single-header'   — §4.3 step 1: not more than one DPoP header field
+ *  - 'well-formed'     — §4.3 step 2: the header value is a well-formed JWT
+ *  - 'required-claims' — §4.3 step 3: jti, htm, htu, iat and the jwk header are present
+ *  - 'typ'             — §4.3 step 4: typ is dpop+jwt
+ *  - 'alg'             — §4.3 step 5: alg is asymmetric and not none
+ *  - 'signature'       — §4.3 step 6: the signature verifies with the embedded jwk
+ *  - 'no-private-key'  — §4.3 step 7: the jwk carries no private key
+ *  - 'htm'             — §4.3 step 8: htm matches the request method
+ *  - 'htu'             — §4.3 step 9: htu matches the token endpoint
+ *  - 'iat'             — §4.3 step 11: iat is inside the acceptance window
+ */
+export type DpopProofCheck =
+  | 'single-header'
+  | 'well-formed'
+  | 'required-claims'
+  | 'typ'
+  | 'alg'
+  | 'signature'
+  | 'no-private-key'
+  | 'htm'
+  | 'htu'
+  | 'iat';
+
+/** jkt bound by a lenient AS when the proof carries no usable jwk. */
+const UNKEYED_JKT = 'conformance-unkeyed-proof';
+
+/**
  * Validate a DPoP proof presented at the token endpoint (the token-request
  * subset of RFC 9449 §4.3). Hand-rolled with jose primitives — deliberately an
  * INDEPENDENT code path from the suite's proof builder, so a shared bug
  * surfaces rather than hides. Returns the JWK thumbprint to bind on success.
+ *
+ * `lenient` names steps to skip; it exists only to build deliberately-broken
+ * test authorization servers. A skipped step lets the defect it guards through,
+ * as a real validator missing that step would.
  */
 export async function validateDpopProofAtTokenEndpoint(
   proof: string,
-  tokenEndpointUrl: string
+  tokenEndpointUrl: string,
+  lenient: ReadonlySet<DpopProofCheck> = new Set()
 ): Promise<{ ok: true; jkt: string } | { ok: false; error: string }> {
   let header: jose.ProtectedHeaderParameters;
   try {
     header = jose.decodeProtectedHeader(proof);
   } catch {
+    if (lenient.has('well-formed')) return { ok: true, jkt: UNKEYED_JKT };
     return { ok: false, error: 'DPoP proof is not a well-formed JWT' };
   }
-  if (header.typ !== 'dpop+jwt') {
+  if (header.typ !== 'dpop+jwt' && !lenient.has('typ')) {
     return { ok: false, error: 'typ must be dpop+jwt' };
   }
-  if (!header.alg || !DPOP_ASYMMETRIC_ALGS.includes(header.alg)) {
+  const asymmetric =
+    typeof header.alg === 'string' && DPOP_ASYMMETRIC_ALGS.includes(header.alg);
+  if (!asymmetric && !lenient.has('alg')) {
     return { ok: false, error: 'alg must be a supported asymmetric algorithm' };
   }
-  const jwk = header.jwk as jose.JWK | undefined;
-  if (!jwk) {
+  let jwk = header.jwk as jose.JWK | undefined;
+  if (!jwk && !lenient.has('required-claims')) {
     return { ok: false, error: 'missing jwk header parameter' };
   }
-  if ((jwk as Record<string, unknown>).d !== undefined) {
-    return { ok: false, error: 'jwk must not contain a private key' };
+  if (jwk && (jwk as Record<string, unknown>).d !== undefined) {
+    if (!lenient.has('no-private-key')) {
+      return { ok: false, error: 'jwk must not contain a private key' };
+    }
+    // A validator that never looks for `d` still verifies with the public
+    // members, so drop the private one rather than fail on it downstream.
+    const publicMembers: Record<string, unknown> = { ...jwk };
+    delete publicMembers.d;
+    jwk = publicMembers as jose.JWK;
   }
+  // Every path that reaches the else branch has a step switched off: a missing
+  // jwk passed only because 'required-claims' is lenient, a none or HMAC alg only
+  // because 'alg' is. Such a validator, like one without the signature step,
+  // reads the claims without verifying anything.
   let claims: jose.JWTPayload;
-  try {
-    const key = await jose.importJWK(jwk, header.alg);
-    claims = (
-      await jose.jwtVerify(proof, key, { algorithms: DPOP_ASYMMETRIC_ALGS })
-    ).payload;
-  } catch {
-    return { ok: false, error: 'DPoP proof signature does not verify' };
+  if (jwk !== undefined && asymmetric && !lenient.has('signature')) {
+    try {
+      const key = await jose.importJWK(jwk, header.alg);
+      claims = (
+        await jose.jwtVerify(proof, key, { algorithms: DPOP_ASYMMETRIC_ALGS })
+      ).payload;
+    } catch {
+      return { ok: false, error: 'DPoP proof signature does not verify' };
+    }
+  } else {
+    try {
+      claims = jose.decodeJwt(proof);
+    } catch {
+      return { ok: false, error: 'DPoP proof is not a well-formed JWT' };
+    }
   }
-  if (typeof claims.jti !== 'string') {
-    return { ok: false, error: 'missing jti claim' };
+  // §4.3 step 3 (presence) is kept apart from the steps that compare a claim's
+  // value, so switching one off never lets the other's defect through.
+  if (!lenient.has('required-claims')) {
+    for (const name of ['jti', 'htm', 'htu', 'iat'] as const) {
+      if (claims[name] === undefined) {
+        return { ok: false, error: `missing ${name} claim` };
+      }
+    }
   }
-  if (claims.htm !== 'POST') {
-    return { ok: false, error: 'htm does not match POST' };
-  }
-  if (typeof claims.htu !== 'string') {
-    return { ok: false, error: 'htu does not match the token endpoint' };
-  }
-  if (claims.htu.includes('?') || claims.htu.includes('#')) {
-    return {
-      ok: false,
-      error: 'htu MUST NOT contain a query or fragment (RFC 9449 §4.2)'
-    };
-  }
-  if (normalizeHtu(claims.htu) !== normalizeHtu(tokenEndpointUrl)) {
-    return { ok: false, error: 'htu does not match the token endpoint' };
+  if (claims.jti !== undefined && typeof claims.jti !== 'string') {
+    return { ok: false, error: 'jti must be a string' };
   }
   if (
-    typeof claims.iat !== 'number' ||
-    Math.abs(Math.floor(Date.now() / 1000) - claims.iat) > 300
+    claims.htm !== undefined &&
+    claims.htm !== 'POST' &&
+    !lenient.has('htm')
+  ) {
+    return { ok: false, error: 'htm does not match POST' };
+  }
+  if (claims.htu !== undefined && !lenient.has('htu')) {
+    if (typeof claims.htu !== 'string') {
+      return { ok: false, error: 'htu does not match the token endpoint' };
+    }
+    if (claims.htu.includes('?') || claims.htu.includes('#')) {
+      return {
+        ok: false,
+        error: 'htu MUST NOT contain a query or fragment (RFC 9449 §4.2)'
+      };
+    }
+    if (normalizeHtu(claims.htu) !== normalizeHtu(tokenEndpointUrl)) {
+      return { ok: false, error: 'htu does not match the token endpoint' };
+    }
+  }
+  if (
+    claims.iat !== undefined &&
+    !lenient.has('iat') &&
+    (typeof claims.iat !== 'number' ||
+      Math.abs(Math.floor(Date.now() / 1000) - claims.iat) > 300)
   ) {
     return { ok: false, error: 'iat outside the acceptable window' };
   }
-  const jkt = await jose.calculateJwkThumbprint(jwk, 'sha256');
+  const jkt = jwk
+    ? await jose.calculateJwkThumbprint(jwk, 'sha256')
+    : UNKEYED_JKT;
   return { ok: true, jkt };
 }
 
@@ -234,6 +312,13 @@ export interface AuthServerOptions {
     | 'accept-any-proof'
     | 'nonce-without-header'
     | 'nonce-accept-any';
+  /**
+   * Negative-test mode: RFC 9449 §4.3 steps the token endpoint skips, each an
+   * independent validation gap (see {@link DpopProofCheck}). Lets a test build
+   * an authorization server missing exactly one check and prove the probe aimed
+   * at that check fails while the others still pass.
+   */
+  dpopLenientProofChecks?: readonly DpopProofCheck[];
   /** Sink for the DPoP token-request observation; see the interface docstring. */
   dpopTokenRequestObs?: DpopTokenRequestObservation;
   /**
@@ -292,6 +377,7 @@ export function createAuthServer(
     metadataIssuer,
     dpopSigningAlgValuesSupported,
     dpopMisbehavior,
+    dpopLenientProofChecks = [],
     dpopTokenRequestObs,
     dpopRequireNonce = false,
     tokenVerifier,
@@ -310,6 +396,9 @@ export function createAuthServer(
   const dpopEnabled =
     dpopSigningAlgValuesSupported !== undefined ||
     dpopMisbehavior !== undefined;
+  const dpopLenient: ReadonlySet<DpopProofCheck> = new Set(
+    dpopLenientProofChecks
+  );
 
   // Records whether the client presented a valid DPoP proof at its
   // authorization_code token request (RFC 9449 §5) into the caller's observation
@@ -599,12 +688,20 @@ export function createAuthServer(
     // ---- DPoP token binding (SEP-1932 / RFC 9449) — opt-in ----
     if (dpopEnabled) {
       const proofHeader = req.headers['dpop'];
-      const proofValue = Array.isArray(proofHeader)
+      let proofValue = Array.isArray(proofHeader)
         ? proofHeader.join(', ')
         : proofHeader;
-      // RFC 9449 §4.2: at most one DPoP header field. Node collapses duplicate
-      // request headers into one comma-joined value; a valid proof JWT contains
-      // no comma, so a comma means more than one proof was sent.
+      // RFC 9449 §4.3 step 1: at most one DPoP header field. Node collapses
+      // duplicate request headers into one comma-joined value; a valid proof
+      // JWT contains no comma, so a comma means more than one proof was sent.
+      // A lenient AS reads the first proof and ignores the rest.
+      if (
+        typeof proofValue === 'string' &&
+        proofValue.includes(',') &&
+        dpopLenient.has('single-header')
+      ) {
+        proofValue = proofValue.split(',')[0].trim();
+      }
       if (typeof proofValue === 'string' && proofValue.includes(',')) {
         recordTokenRequestProof(
           grantType,
@@ -632,7 +729,11 @@ export function createAuthServer(
         const result =
           dpopMisbehavior === 'accept-any-proof'
             ? await thumbprintOfPresentedProof(proof)
-            : await validateDpopProofAtTokenEndpoint(proof, tokenEndpointUrl);
+            : await validateDpopProofAtTokenEndpoint(
+                proof,
+                tokenEndpointUrl,
+                dpopLenient
+              );
         if (!result.ok) {
           recordTokenRequestProof(grantType, false, result.error);
           res.status(400).json({

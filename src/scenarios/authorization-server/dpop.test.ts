@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
   createAuthServer,
-  type AuthServerOptions
+  type AuthServerOptions,
+  type DpopProofCheck
 } from '../client/auth/helpers/createAuthServer';
 import { ServerLifecycle } from '../client/auth/helpers/serverLifecycle';
 import { testScenarioContext } from '../../mock-server/testing';
@@ -160,6 +161,69 @@ describe('DPoPAuthorizationServerScenario — one-defect isolation', () => {
   });
 });
 
+/**
+ * The invalid-proof probes, keyed by the RFC 9449 §4.3 step each one targets.
+ * An AS that skips exactly one step must fail exactly that step's probes, and
+ * every other probe must still pass: a probe that only fails against an AS
+ * with no validation at all proves nothing about the step it names.
+ */
+const PROBES_BY_STEP: Record<DpopProofCheck, readonly string[]> = {
+  'single-header': ['RejectsDuplicateDpopHeader'],
+  'well-formed': ['RejectsMalformedProof'],
+  'required-claims': [
+    'RejectsMissingJti',
+    'RejectsMissingHtm',
+    'RejectsMissingHtu',
+    'RejectsMissingIat',
+    'RejectsMissingJwk'
+  ],
+  typ: ['RejectsWrongTyp'],
+  alg: ['RejectsAlgNone', 'RejectsAlgSymmetric'],
+  signature: ['RejectsTamperedSignature', 'RejectsSignatureByOtherKey'],
+  'no-private-key': ['RejectsPrivateKeyInJwk'],
+  htm: ['RejectsHtmMismatch'],
+  htu: ['RejectsWrongHtu'],
+  iat: ['RejectsStaleIat', 'RejectsFutureIat']
+};
+const ALL_PROBES = Object.values(PROBES_BY_STEP).flat();
+
+describe('DPoPAuthorizationServerScenario — invalid-proof battery', () => {
+  it('a compliant AS passes every invalid-proof probe', async () => {
+    const checks = await runAgainst(COMPLIANT);
+    const probes = checks.filter(
+      (c) => c.id === 'sep-1932-as-rejects-invalid-proof'
+    );
+    expect(probes.map((c) => c.name).sort()).toEqual([...ALL_PROBES].sort());
+    for (const probe of probes) {
+      expect(probe.status, probe.name).toBe('SUCCESS');
+    }
+  });
+
+  for (const [step, failing] of Object.entries(PROBES_BY_STEP) as Array<
+    [DpopProofCheck, readonly string[]]
+  >) {
+    it(`an AS that skips ${step} fails ${failing.join(', ')} and nothing else`, async () => {
+      const checks = await runAgainst({
+        ...COMPLIANT,
+        dpopLenientProofChecks: [step]
+      });
+      for (const id of ALL_IDS) {
+        expect(statusOf(checks, id), id).toBe('SUCCESS');
+      }
+      for (const name of ALL_PROBES) {
+        const probe = named(checks, name);
+        if (failing.includes(name)) {
+          expect(probe?.status, name).toBe('FAILURE');
+          expect(probe?.details).not.toMatchObject({ untestable: true });
+          expect(probe?.errorMessage).toContain('issued an access token');
+        } else {
+          expect(probe?.status, name).toBe('SUCCESS');
+        }
+      }
+    });
+  }
+});
+
 describe('DPoPAuthorizationServerScenario — skip conditions', () => {
   it('skips the token-binding check when no client_id is supplied', async () => {
     const checks = await runAgainst(COMPLIANT, false);
@@ -223,7 +287,7 @@ describe('DPoPAuthorizationServerScenario — negative probes', () => {
       dpopMisbehavior: 'unbound-token'
     });
     expect(statusOf(checks, 'sep-1932-as-token-binding')).toBe('FAILURE');
-    for (const name of ['RejectsTamperedSignature', 'RejectsWrongHtu']) {
+    for (const name of ALL_PROBES) {
       const check = named(checks, name);
       expect(check?.status).toBe('FAILURE');
       expect(check?.details).toMatchObject({ untestable: true });
@@ -250,7 +314,7 @@ describe('DPoPAuthorizationServerScenario — negative probes', () => {
     expect(
       checks.find((c) => c.id === 'sep-1932-as-token-binding')?.errorMessage
     ).toContain('use_dpop_nonce');
-    for (const name of ['RejectsTamperedSignature', 'RejectsWrongHtu']) {
+    for (const name of ALL_PROBES) {
       expect(named(checks, name)?.details).toMatchObject({ untestable: true });
     }
   });
@@ -281,7 +345,7 @@ describe('DPoPAuthorizationServerScenario — negative probes', () => {
         new LoginGatedDpopScenario()
       );
       expect(statusOf(checks, 'sep-1932-as-token-binding')).toBe('SUCCESS');
-      for (const name of ['RejectsTamperedSignature', 'RejectsWrongHtu']) {
+      for (const name of ALL_PROBES) {
         const check = named(checks, name);
         expect(check?.status).toBe('FAILURE');
         expect(check?.details).toMatchObject({ untestable: true });

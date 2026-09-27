@@ -8,9 +8,12 @@
  *    and does not include the `none` or symmetric algorithms;
  *  - token binding: a code exchanged WITH a DPoP proof yields a token bound to
  *    the proof key (`cnf.jkt`) with `token_type: DPoP` (RFC 9449 §5–§6);
- *  - invalid proofs: a tampered signature and an `htu` that is not the token
- *    endpoint are rejected with HTTP 400 `invalid_dpop_proof` (RFC 9449 §5),
- *    but only after the binding check succeeded;
+ *  - invalid proofs: one probe per RFC 9449 §4.3 step a token request can
+ *    exercise (a second DPoP header, a non-JWT, each missing claim and the
+ *    missing jwk, a wrong typ, alg none and a symmetric alg, a tampered
+ *    signature and one made by another key, a private jwk, a wrong htm or htu,
+ *    a stale or future iat) is rejected with HTTP 400 `invalid_dpop_proof`
+ *    (RFC 9449 §5), but only after the binding check succeeded;
  *  - nonce: when the first exchange is `use_dpop_nonce`, the challenge carries
  *    `DPoP-Nonce`, the retry with that nonce succeeds, and a wrong nonce is
  *    rejected (RFC 9449 §4.3 step 10, §8).
@@ -43,7 +46,8 @@ import { createHash, randomBytes } from 'crypto';
 import { startCallbackServer } from './auth/helpers/createCallbackServer';
 import {
   generateDpopKeyPair,
-  buildDpopProof
+  buildDpopProof,
+  type DpopKeyPair
 } from '../client/auth/helpers/dpopProof';
 import { readTokenBinding } from '../client/auth/helpers/dpopToken';
 import { untestableCheck } from '../untestable';
@@ -208,21 +212,166 @@ const CHECK_DEFS: Record<
   }
 };
 
-/** Invalid-proof probes. Each spends its own authorization code. */
-const INVALID_PROOF_CASES = [
+/** What an invalid-proof probe needs to build its DPoP header value. */
+interface InvalidProofInputs {
+  keyPair: DpopKeyPair;
+  /** A second key of the same algorithm, never bound to anything. */
+  otherKeyPair: DpopKeyPair;
+  htu: string;
+  alg: string;
+}
+
+/** A probe offset for `iat` well outside any acceptance window (RFC 9449 §11.1). */
+const IAT_PROBE_OFFSET_SECONDS = 3600;
+
+/**
+ * Invalid-proof probes, one defect each, covering the RFC 9449 §4.3 steps a
+ * token request exercises (step 10 is the nonce probe; step 12 needs an access
+ * token and belongs to the resource server). Each probe spends its own
+ * authorization code. `build` returns an array to send the header field twice.
+ */
+const INVALID_PROOF_CASES: ReadonlyArray<{
+  caseId: string;
+  name: string;
+  description: string;
+  build: (inputs: InvalidProofInputs) => Promise<string | string[]>;
+}> = [
+  {
+    caseId: 'duplicate-dpop-header',
+    name: 'RejectsDuplicateDpopHeader',
+    description:
+      'Authorization server rejects a token request carrying two DPoP header fields (RFC 9449 §4.3 step 1)',
+    build: async ({ keyPair, htu, alg }) => [
+      await buildDpopProof({ keyPair, htm: 'POST', htu, alg }),
+      await buildDpopProof({ keyPair, htm: 'POST', htu, alg })
+    ]
+  },
+  {
+    caseId: 'malformed-not-a-jwt',
+    name: 'RejectsMalformedProof',
+    description:
+      'Authorization server rejects a DPoP header value that is not a JWT (RFC 9449 §4.3 step 2)',
+    build: async () => 'not-a-dpop-proof-jwt'
+  },
+  ...(['jti', 'htm', 'htu', 'iat'] as const).map((claim) => ({
+    caseId: `missing-${claim}`,
+    name: `RejectsMissing${claim[0].toUpperCase()}${claim.slice(1)}`,
+    description: `Authorization server rejects a DPoP proof without the ${claim} claim (RFC 9449 §4.3 step 3)`,
+    build: ({ keyPair, htu, alg }: InvalidProofInputs) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, alg, omit: [claim] })
+  })),
+  {
+    caseId: 'missing-jwk',
+    name: 'RejectsMissingJwk',
+    description:
+      'Authorization server rejects a DPoP proof without the jwk header parameter (RFC 9449 §4.3 step 3)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, alg, omit: ['jwk'] })
+  },
+  {
+    caseId: 'wrong-typ',
+    name: 'RejectsWrongTyp',
+    description:
+      'Authorization server rejects a DPoP proof whose typ is not dpop+jwt (RFC 9449 §4.3 step 4)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, alg, typ: 'JWT' })
+  },
+  {
+    caseId: 'alg-none',
+    name: 'RejectsAlgNone',
+    description:
+      'Authorization server rejects an unsigned DPoP proof with alg none (RFC 9449 §4.3 step 5)',
+    build: ({ keyPair, htu }) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, unsigned: true })
+  },
+  {
+    caseId: 'alg-symmetric',
+    name: 'RejectsAlgSymmetric',
+    description:
+      'Authorization server rejects a DPoP proof signed with a symmetric algorithm (RFC 9449 §4.3 step 5)',
+    build: ({ keyPair, htu }) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, symmetric: true })
+  },
   {
     caseId: 'tampered-signature',
     name: 'RejectsTamperedSignature',
     description:
-      'Authorization server rejects a DPoP proof with a tampered signature'
+      'Authorization server rejects a DPoP proof with a tampered signature (RFC 9449 §4.3 step 6)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, alg, tamperSignature: true })
+  },
+  {
+    caseId: 'signed-by-other-key',
+    name: 'RejectsSignatureByOtherKey',
+    description:
+      'Authorization server rejects a DPoP proof signed by a key other than the one in its jwk header (RFC 9449 §4.3 step 6)',
+    build: ({ keyPair, otherKeyPair, htu, alg }) =>
+      buildDpopProof({
+        keyPair: otherKeyPair,
+        htm: 'POST',
+        htu,
+        alg,
+        jwkOverride: keyPair.publicJwk
+      })
+  },
+  {
+    caseId: 'private-key-in-jwk',
+    name: 'RejectsPrivateKeyInJwk',
+    description:
+      'Authorization server rejects a DPoP proof whose jwk header carries the private key (RFC 9449 §4.3 step 7)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({ keyPair, htm: 'POST', htu, alg, embedPrivateKey: true })
+  },
+  {
+    caseId: 'htm-mismatch',
+    name: 'RejectsHtmMismatch',
+    description:
+      'Authorization server rejects a DPoP proof whose htm is not POST (RFC 9449 §4.3 step 8)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({ keyPair, htm: 'GET', htu, alg })
   },
   {
     caseId: 'wrong-htu',
     name: 'RejectsWrongHtu',
     description:
-      'Authorization server rejects a DPoP proof whose htu is not the token endpoint'
+      'Authorization server rejects a DPoP proof whose htu is not the token endpoint (RFC 9449 §4.3 step 9)',
+    build: ({ keyPair, alg }) =>
+      buildDpopProof({
+        keyPair,
+        htm: 'POST',
+        htu: 'https://dpop-negative.invalid/not-the-token-endpoint',
+        alg
+      })
+  },
+  {
+    caseId: 'stale-iat',
+    name: 'RejectsStaleIat',
+    description:
+      'Authorization server rejects a DPoP proof created an hour ago (RFC 9449 §4.3 step 11)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({
+        keyPair,
+        htm: 'POST',
+        htu,
+        alg,
+        iat: Math.floor(Date.now() / 1000) - IAT_PROBE_OFFSET_SECONDS
+      })
+  },
+  {
+    caseId: 'future-iat',
+    name: 'RejectsFutureIat',
+    description:
+      'Authorization server rejects a DPoP proof dated an hour ahead (RFC 9449 §4.3 step 11)',
+    build: ({ keyPair, htu, alg }) =>
+      buildDpopProof({
+        keyPair,
+        htm: 'POST',
+        htu,
+        alg,
+        iat: Math.floor(Date.now() / 1000) + IAT_PROBE_OFFSET_SECONDS
+      })
   }
-] as const;
+];
 
 /** Proof-JWS algorithms the harness can generate a key + proof for. */
 const SUPPORTED_PROOF_ALGS = [
@@ -309,7 +458,7 @@ export class DPoPAuthorizationServerScenario implements ClientScenarioForAuthori
 - Metadata MUST advertise \`dpop_signing_alg_values_supported\` (RFC 9449 §5.1)
 - \`dpop_signing_alg_values_supported\` MUST list only asymmetric algorithms (no \`none\` or symmetric algorithms)
 - A token issued for a request carrying a DPoP proof MUST be bound to the proof key: \`cnf.jkt\` equals the JWK thumbprint and \`token_type\` is \`DPoP\` (RFC 9449 §5–§6)
-- An invalid DPoP proof (tampered signature, or \`htu\` other than the token endpoint) MUST be rejected with HTTP 400 \`invalid_dpop_proof\` (RFC 9449 §5). These probes run only after the binding check succeeded
+- An invalid DPoP proof MUST be rejected with HTTP 400 \`invalid_dpop_proof\` (RFC 9449 §5). One probe per RFC 9449 §4.3 step a token request exercises: a second DPoP header, a non-JWT value, a missing \`jti\`, \`htm\`, \`htu\`, \`iat\` or \`jwk\`, a wrong \`typ\`, \`alg\` none or symmetric, a tampered signature, a signature by a key other than the embedded \`jwk\`, a private key in \`jwk\`, an \`htm\` other than POST, an \`htu\` other than the token endpoint, and an \`iat\` an hour stale or an hour ahead. These probes run only after the binding check succeeded
 - When the token endpoint answers with \`use_dpop_nonce\`, the challenge includes a \`DPoP-Nonce\` header, a retry carrying that nonce succeeds, and a proof with a different nonce is rejected (RFC 9449 §4.3 step 10, §8)
 
 An AS that does not advertise \`dpop_signing_alg_values_supported\` is treated as
@@ -766,19 +915,11 @@ not testable rather than skipped.`;
     checks: ConformanceCheck[]
   ): Promise<void> {
     const htu = stripUrlQuery(metadata.token_endpoint);
+    const otherKeyPair = await generateDpopKeyPair(alg);
     for (const probe of INVALID_PROOF_CASES) {
       try {
         const fresh = await this.obtainAuthorizationCode(metadata, options);
-        const proof = await buildDpopProof(
-          probe.caseId === 'tampered-signature'
-            ? { keyPair, htm: 'POST', htu, alg, tamperSignature: true }
-            : {
-                keyPair,
-                htm: 'POST',
-                htu: 'https://dpop-negative.invalid/not-the-token-endpoint',
-                alg
-              }
-        );
+        const proof = await probe.build({ keyPair, otherKeyPair, htu, alg });
         const result = await this.exchangeCode(
           metadata,
           options,
@@ -1089,7 +1230,7 @@ not testable rather than skipped.`;
     options: AuthorizationServerOptions,
     code: string,
     codeVerifier: string,
-    proof?: string
+    proof?: string | string[]
   ): Promise<TokenExchangeResult> {
     const redirectUri = `${REDIRECT_URI_ORIGIN}:${options.port}${REDIRECT_URI_PATH}`;
     const params = new URLSearchParams({
@@ -1103,7 +1244,7 @@ not testable rather than skipped.`;
     if (options.resource) {
       params.set('resource', options.resource);
     }
-    const headers: Record<string, string> = {
+    const headers: Record<string, string | string[]> = {
       'content-type': 'application/x-www-form-urlencoded'
     };
     if (proof) {

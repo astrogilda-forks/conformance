@@ -190,4 +190,55 @@ describe('validateDpopProofAtTokenEndpoint — rejects each single defect', () =
       })
     ).toMatch(/iat/);
   });
+
+  for (const claim of ['htm', 'htu', 'iat'] as const) {
+    it(`rejects a missing ${claim}`, async () => {
+      const kp = await generateDpopKeyPair();
+      expect(
+        await expectRejected({
+          keyPair: kp,
+          htm: 'POST',
+          htu: TOKEN_ENDPOINT,
+          omit: [claim]
+        })
+      ).toMatch(new RegExp(`missing ${claim}`));
+    });
+  }
+
+  it('rejects a missing jwk header parameter', async () => {
+    const kp = await generateDpopKeyPair();
+    expect(
+      await expectRejected({
+        keyPair: kp,
+        htm: 'POST',
+        htu: TOKEN_ENDPOINT,
+        omit: ['jwk']
+      })
+    ).toMatch(/jwk/);
+  });
+
+  it('rejects a proof signed by a key other than the embedded jwk', async () => {
+    const signer = await generateDpopKeyPair();
+    const embedded = await generateDpopKeyPair();
+    expect(
+      await expectRejected({
+        keyPair: signer,
+        htm: 'POST',
+        htu: TOKEN_ENDPOINT,
+        jwkOverride: embedded.publicJwk
+      })
+    ).toMatch(/signature/);
+  });
+
+  it('rejects an iat an hour in the future', async () => {
+    const kp = await generateDpopKeyPair();
+    expect(
+      await expectRejected({
+        keyPair: kp,
+        htm: 'POST',
+        htu: TOKEN_ENDPOINT,
+        iat: Math.floor(Date.now() / 1000) + 3600
+      })
+    ).toMatch(/iat/);
+  });
 });
